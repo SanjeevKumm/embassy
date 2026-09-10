@@ -562,6 +562,16 @@ struct InnerFlexSpi<'d, M: Mode> {
     dma: Option<DmaState<'d>>,
     /// The index of the chip we're set up to use. The current impl only supports 1 chip at a time
     chip_index: u8,
+    /// Base added to logical NOR offsets when issuing FlexSPI IP commands.
+    ///
+    /// Zero by default. Platforms whose flash occupies a later FlexSPI
+    /// address region may set this after controller configuration.
+    ip_sfar_base: u32,
+    /// FLSHCR2 slot used when preparing IP commands.
+    ///
+    /// Normally identical to `chip_index`. A platform that remaps the
+    /// configured flash to another hardware slot may update this afterward.
+    ip_config_index: u8,
     flash: FlashConfig,
     _wg: Option<WakeGuard>,
     _phantom: PhantomData<M>,
@@ -599,6 +609,8 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
             info: T::info(),
             dma,
             chip_index,
+            ip_sfar_base: 0,
+            ip_config_index: chip_index,
             flash,
             _wg: parts.wake_guard,
             _phantom: PhantomData,
@@ -612,6 +624,50 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         }
 
         Ok(flash_driver)
+    }
+
+    /// Attach to an already-configured FlexSPI controller that is actively
+    /// supplying XIP instruction fetches.
+    ///
+    /// This deliberately does not enable/reset the peripheral or initialize
+    /// the controller/flash again.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that FlexSPI, its pins, LUT, AHB mapping,
+    /// and flash device are already configured compatibly with `flash`.
+    unsafe fn new_inner_xip_attached<T: Instance>(
+        _peri: Peri<'d, T>,
+        chip_index: u8,
+        flash: FlashConfig,
+    ) -> Result<Self, SetupError> {
+        if flash.page_size == 0 || flash.page_size > MAX_PAGE_SIZE {
+            return Err(SetupError::InvalidPageSize);
+        }
+
+        if chip_index != 0 {
+            #[cfg(feature = "defmt")]
+            defmt::warn!(
+                "Using flexspi with chip index {} is untested and might not work",
+                chip_index
+            );
+        }
+
+        Ok(Self {
+            info: T::info(),
+            dma: None,
+            chip_index,
+            ip_sfar_base: 0,
+            ip_config_index: chip_index,
+            flash,
+            _wg: None,
+            _phantom: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn ip_sfar(&self, address: u32) -> u32 {
+        self.ip_sfar_base.wrapping_add(address)
     }
 
     pub fn page_size(&self) -> usize {
@@ -930,7 +986,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         self.info.regs.inten().write(|_| {});
         self.info
             .regs
-            .flshcr2(self.chip_index as usize)
+            .flshcr2(self.ip_config_index as usize)
             .modify(|r: &mut Flshcr2| r.set_clrinstrptr(true));
         self.info.regs.intr().write(|r: &mut Intr| {
             r.set_ahbcmderr(true);
@@ -973,7 +1029,10 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     ) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_sfar(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data_size);
             r.set_iseqid(seq_index as u8);
@@ -997,7 +1056,10 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     fn issue_ip_write_command(&mut self, address: u32, seq_index: usize, data: &[u8]) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_sfar(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data.len() as u16);
             r.set_iseqid(seq_index as u8);
@@ -1036,7 +1098,10 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     fn issue_ip_read_command(&mut self, address: u32, seq_index: usize, buffer: &mut [u8]) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_sfar(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(buffer.len() as u16);
             r.set_iseqid(seq_index as u8);
@@ -1202,7 +1267,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
     ) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_sfar(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data_size);
             r.set_iseqid(seq_index as u8);
@@ -1229,7 +1297,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
     ) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_sfar(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data.len() as u16);
             r.set_iseqid(seq_index as u8);
@@ -1272,7 +1343,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
     ) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_sfar(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(buffer.len() as u16);
             r.set_iseqid(seq_index as u8);
@@ -1307,7 +1381,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
 
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_sfar(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data_len as u16);
             r.set_iseqid(seq_index as u8);
@@ -1355,7 +1432,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
 
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_sfar(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data_len as u16);
             r.set_iseqid(seq_index as u8);
@@ -1503,6 +1583,38 @@ impl<'d> Flexspi<'d, Blocking> {
 
         Ok(Self {
             inner: InnerFlexSpi::new_inner(peri, None, clock, ss.chip_index(), flash)?,
+        })
+    }
+
+    /// Set the address base used for subsequent IP commands.
+    ///
+    /// Public NOR APIs remain zero-based. This base is added only when
+    /// programming IPCR0.SFAR for an IP command.
+    pub fn set_ip_sfar_base(&mut self, base: u32) {
+        self.inner.ip_sfar_base = base;
+    }
+
+    /// Set the physical FLSHCR2 slot used while preparing IP commands.
+    pub fn set_ip_config_index(&mut self, index: u8) {
+        self.inner.ip_config_index = index;
+    }
+
+    /// Attach to a FlexSPI controller already configured for active XIP.
+    ///
+    /// Unlike `new_blocking`, this does not mux pins, reset the peripheral,
+    /// initialize controller registers, reload the LUT, or reset the NOR.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that this peripheral and flash are already
+    /// configured compatibly with the supplied `FlashConfig`.
+    pub unsafe fn new_blocking_xip_attached<T: Instance, P: Port>(
+        peri: Peri<'d, T>,
+        ss: Peri<'d, impl SsPin<T, P> + 'd>,
+        flash: FlashConfig,
+    ) -> Result<Self, SetupError> {
+        Ok(Self {
+            inner: unsafe { InnerFlexSpi::new_inner_xip_attached(peri, ss.chip_index(), flash)? },
         })
     }
 }
