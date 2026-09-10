@@ -1317,22 +1317,43 @@ impl<'d> InnerFlexSpi<'d, Async> {
         let mut offset = 0;
 
         while offset < data.len() {
-            self.wait_for_tx_watermark_async().await?;
+            while !self.info.regs.intr().read().iptxwe() {}
 
             let chunk_len = (8 * tx_watermark).min(data.len() - offset);
-            for (index, chunk) in data[offset..offset + chunk_len].chunks(4).enumerate() {
-                // Pad the trailing partial word with 0xFF (see the blocking
-                // sibling above for why).
+
+            let mut word_index = 0;
+            let mut byte_offset = 0;
+
+            while byte_offset < chunk_len {
+                let remaining = chunk_len - byte_offset;
+                let copy_len = remaining.min(4);
+
                 let mut word = [0xFFu8; 4];
-                word[..chunk.len()].copy_from_slice(chunk);
-                self.info.regs.tfdr(index).write_value(Tfdr(u32::from_le_bytes(word)));
+
+                let src_start = offset + byte_offset;
+
+                let mut i = 0;
+                while i < copy_len {
+                    word[i] = data[src_start + i];
+                    i += 1;
+                }
+
+                self.info
+                    .regs
+                    .tfdr(word_index)
+                    .write_value(Tfdr(u32::from_le_bytes(word)));
+
+                word_index += 1;
+                byte_offset += copy_len;
             }
 
             offset += chunk_len;
             self.info.regs.intr().write(|r: &mut Intr| r.set_iptxwe(true));
         }
 
-        self.wait_for_command_completion_async().await
+        self.wait_ip_command_done();
+        self.wait_idle();
+        self.wait_no_ip_error()
     }
 
     async fn issue_ip_read_command_async(
